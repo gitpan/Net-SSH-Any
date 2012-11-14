@@ -1,6 +1,6 @@
 package Net::SSH::Any;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 use strict;
 use warnings;
@@ -69,7 +69,7 @@ sub new {
     my $any = { host => $host,
                  user => $user,
                  port => $port,
-                 passwd => $passwd,
+                 password => $passwd,
                  key_path => $key_path,
                  passphrase => $passphrase,
                  timeout => $timeout,
@@ -330,6 +330,18 @@ sub _delete_stream_encoding_and_encode_input_data {
     $stream_encoding
 }
 
+sub _check_child_error {
+    my $any = shift;
+    $any->error and return;
+    if ($?) {
+        $any->_set_error(SSHA_REMOTE_CMD_ERROR,
+                         "remote command failed with code " . ($? >> 8)
+                         . " and signal " . ($? & 255));
+        return;
+    }
+    return 1;
+}
+
 _sub_options capture => qw(timeout stdin_data stderr_to_stdout stderr_discard
                            stderr_fh stderr_file);
 sub capture {
@@ -377,6 +389,17 @@ sub system {
     my $cmd = $any->_quote_args(\%opts, @_);
     _croak_bad_options %opts;
     $any->_system(\%opts, $cmd);
+    $any->_check_child_error;
+}
+
+_sub_options pipe => qw(stderr_to_stdout stderr_discard);
+sub pipe {
+    my $any = shift;
+    $any->_clear_error or return undef;
+    my %opts = (ref $_[0] eq 'HASH' ? %{shift()} : ());
+    my $cmd = $any->_quote_args(\%opts, @_);
+    _croak_bad_options %opts;
+    $any->_pipe(\%opts, $cmd);
 }
 
 # transparently delegate method calls to backend packages:
@@ -389,6 +412,15 @@ sub AUTOLOAD {
     };
     *{$AUTOLOAD} = $sub;
     goto &$sub;
+}
+
+sub DESTROY {
+    my $any = shift;
+    my $be = $any->{backend_module};
+    if (defined $be) {
+        my $sub = $be->can('DESTROY');
+        $sub->($any) if $sub;
+    }
 }
 
 1;

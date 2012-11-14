@@ -15,7 +15,7 @@ use Errno ();
 
 sub _backend_api_version { 1 }
 
-my ($block_inbound, $block_outbound, $eagain);
+our ($block_inbound, $block_outbound, $eagain);
 do {
     local ($@, $SIG{__DIE__});
     $block_inbound  = (eval { Net::SSH2::LIBSSH2_SOCKET_BLOCK_INBOUND()  } ||   1);
@@ -23,13 +23,21 @@ do {
     $eagain         = (eval { Net::SSH2::LIBSSH2_ERROR_EAGAIN()          } || -37);
 };
 
+sub __set_error_from_ssh_error_code {
+    my ($any, $ssh_error_code, $error) = @_;
+    $error = ($ssh_error_code == $eagain ? SSHA_EAGAIN : ($error || SSHA_CHANNEL_ERROR));
+    $any->_set_error($error, "libssh2 error $ssh_error_code");
+    ()
+}
+
 sub __copy_error {
     my $any = shift;
     my $ssh2 = $any->{be_ssh2}
         or die "internal error: __copy_error called, but there is no ssh2 object";
     my $error = $ssh2->error
         or die "internal error: __copy_error called, but there is no error";
-    $any->_set_error(shift || SSHA_CHANNEL_ERROR, ($ssh2->error)[2]);
+    my $code = ($error == $eagain ? SSHA_EAGAIN : (shift || SSHA_CHANNEL_ERROR));
+    $any->_set_error($code, ($ssh2->error)[2]);
     ()
 }
 
@@ -59,6 +67,11 @@ sub _connect {
         $any->_set_error(SSHA_CONNECTION_ERROR, "Authentication failed");
         return;
     }
+
+    my $bm = '';
+    vec ($bm, fileno($ssh2->sock), 1) = 1;
+    $any->{__select_bm} = $bm;
+    1;
 }
 
 sub __open_file {
@@ -109,7 +122,6 @@ sub _system {
     my ($out_fh, $err_fh) = __parse_fh_opts($any, $opts, $channel) or return;
     $channel->exec($cmd);
     __io3($any, $ssh2, $channel, $opts->{stdin_data}, $out_fh || \*STDOUT, $err_fh || \*STDERR);
-    not $?;
 }
 
 sub _capture {
@@ -149,31 +161,54 @@ sub __write_all {
     return 1;
 }
 
-sub __check_channel_error {
+sub __check_channel_error_nb {
     my $any = shift;
     my $error = $any->{be_ssh2}->error;
     return 1 unless $error and $error != $eagain;
     __copy_error($any, SSHA_CHANNEL_ERROR);
 }
 
+sub __check_channel_error {
+    my $any = shift;
+    my $error = $any->{be_ssh2}->error;
+    return 1 unless $error;
+    __copy_error($any, SSHA_CHANNEL_ERROR);
+}
+
+sub _wait_for_more_data {
+    my ($any, $timeout) = @_;
+    my $ssh2 = $any->{be_ssh2};
+    if (my $dir = $ssh2->block_directions) {
+        my $wr = ($dir & $block_inbound  ? $any->{__select_bm} : '');
+        my $ww = ($dir & $block_outbound ? $any->{__select_bm} : '');
+        select($wr, $ww, undef, $timeout);
+    }
+}
+
 sub __io3 {
     my ($any, $ssh2, $channel, $stdin_data, @fh) = @_;
-    my $fn = fileno($ssh2->sock);
-    my $bm = '';
-    vec ($bm, $fn, 1) = 1;
     $channel->blocking(0);
     my $in = '';
     my @cap = ('', '');
     my $eof_sent;
     while (1) {
+        my $delay = 1;
         #$debug and $debug and 1024 and _debug("looping...");
         $in .= shift @$stdin_data while @$stdin_data and length $in < 36000;
         if (length $in) {
-            if (my $bytes = $channel->write($in)) {
-                substr($in, 0, $bytes, '');
+            my $bytes = $channel->write($in);
+            if (not $bytes) {
+                __check_channel_error_nb($any) or last;
+            }
+            elsif ($bytes < 0) {
+                if ($bytes != $eagain) {
+                    $any->_set_error(SSHA_CHANNEL_ERROR, $bytes);
+                    last;
+                }
             }
             else {
-                __check_channel_error($any) or last;
+                $delay = 0;
+                substr($in, 0, $bytes, '');
             }
         }
         elsif (!$eof_sent) {
@@ -181,7 +216,18 @@ sub __io3 {
             $eof_sent = 1;
         }
         for my $ext (0, 1) {
-            if (my $bytes = $channel->read(my($buf), 36000, $ext)) {
+            my $bytes = $channel->read(my($buf), 36000, $ext);
+            if (not $bytes) {
+                __check_channel_error_nb($any) or last;
+            }
+            elsif ($bytes < 0) {
+                if ($bytes != $eagain) {
+                    $any->_set_error(SSHA_CHANNEL_ERROR, $bytes);
+                    last;
+                }
+            }
+            else {
+                $delay = 0;
                 if ($fh[$ext]) {
                     __write_all($any, $fh[$ext], $buf) or last;
                 }
@@ -189,16 +235,10 @@ sub __io3 {
                     $cap[$ext] .= $buf;
                 }
             }
-            else {
-                __check_channel_error($any) or last;
-            }
         }
         last if $channel->eof;
 
-        my $dir = $ssh2->block_directions;
-        my $wr = ($dir & $block_inbound  ? $bm : '');
-        my $ww = ($dir & $block_outbound ? $bm : '');
-        select($wr, $ww, undef, 2);
+        $any->_wait_for_more_data(0.2) if $delay;
     }
 
     $channel->blocking(1);
@@ -212,6 +252,47 @@ sub __io3 {
 
     $? = (($code << 8) | $signal);
     return @cap;
+}
+
+sub _pipe {
+    my ($any, $opts, $cmd) = @_;
+    my $ssh2 = $any->{be_ssh2} or return;
+    my $channel = $ssh2->channel;
+    __parse_fh_opts($any, $opts, $channel) or return;
+
+    require Net::SSH::Any::Backend::Net_SSH2::Pipe;
+    Net::SSH::Any::Backend::Net_SSH2::Pipe->_new($any, $channel);
+}
+
+sub _syswrite {
+    my ($any, $channel) = @_;
+    my $bytes = $channel->write($_[2]);
+    if (not $bytes) {
+        __check_channel_error($any) or return undef;
+    }
+    elsif ($bytes < 0) {
+        __set_error_from_ssh_error_code($any, $bytes);
+        return undef;
+    }
+    $bytes;
+}
+
+# appends at the end of $_[2] always!
+sub _sysread {
+    my ($any, $channel, undef, $len, $ext) = @_;
+    my $bytes = $channel->read(my($buf), $len, $ext);
+    if (not $bytes) {
+        __check_channel_error($any) or return undef;
+    }
+    elsif ($bytes < 0) {
+        __set_error_from_ssh_error_code($any, $bytes);
+        return undef;
+    }
+    else {
+        no warnings;
+        $_[2] .= $buf;
+    }
+    $bytes;
 }
 
 1;
