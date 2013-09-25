@@ -6,12 +6,27 @@ use warnings;
 use Carp;
 our @CARP_NOT = qw(Net::SSH::Any);
 
-use Net::SSH::Any::Util;
+use Net::SSH::Any::Util qw($debug _debug _debug_hexdump _first_defined);
 use Net::SSH::Any::Constants qw(:error);
 
 use Net::SSH2;
 use File::Spec;
 use Errno ();
+use Time::HiRes ();
+
+use Config;
+my %sig_name2num;
+if (defined($Config{sig_name})) {
+    my $i = 0;
+    $sig_name2num{$_} = $i++ for split //, $Config{sig_name};
+}
+
+sub _sig_name2num {
+    my $signal = shift;
+    return 0 unless defined $signal and length $signal;
+    my $num = $sig_name2num{$signal};
+    (defined $num ? $num : 254);
+}
 
 sub _backend_api_version { 1 }
 
@@ -27,7 +42,7 @@ sub __set_error_from_ssh_error_code {
     my ($any, $ssh_error_code, $error) = @_;
     $error = ($ssh_error_code == $eagain ? SSHA_EAGAIN : ($error || SSHA_CHANNEL_ERROR));
     $any->_set_error($error, "libssh2 error $ssh_error_code");
-    ()
+    return;
 }
 
 sub __copy_error {
@@ -38,7 +53,7 @@ sub __copy_error {
         or die "internal error: __copy_error called, but there is no error";
     my $code = ($error == $eagain ? SSHA_EAGAIN : (shift || SSHA_CHANNEL_ERROR));
     $any->_set_error($code, ($ssh2->error)[2]);
-    ()
+    return;
 }
 
 sub _connect {
@@ -48,15 +63,18 @@ sub _connect {
         $any->_set_error(SSHA_CONNECTION_ERROR, "Unable to create Net::SSH2 object");
         return;
     }
-    $debug and $debug & 2048 and $ssh2->trace(1);
+    $debug and $debug & 2048 and $ssh2->trace(-1);
 
     my @args = ($any->{host}, $any->{port} || 22);
     push @args, Timeout => $any->{timeout} if defined $any->{timeout};
     $ssh2->connect(@args) or
-        return __copy_error($any, SSHA_CONNECTION_ERROR);
+        # return __copy_error($any, SSHA_CONNECTION_ERROR); # Net::SSH2::connect does not set error
+        return $any->_set_error(SSHA_CONNECTION_ERROR, "Unable to connect to remote host");
 
     my %aa;
-    $aa{username} = $any->{user} if defined $any->{user};
+    $aa{username} = _first_defined($any->{user},
+                                   eval { (getpwuid $<)[0] },
+                                   eval { getlogin() });
     $aa{password} = $any->{password} if defined $any->{password};
     $aa{password} = $any->{passphrase} if defined $any->{passphrase};
     @aa{'privatekey', 'publickey'} = ($any->{key_path}, "$any->{key_path}.pub") if defined $any->{key_path};
@@ -115,31 +133,42 @@ sub __parse_fh_opts {
     return @fh;
 }
 
-sub _system {
+sub __open_channel_and_exec {
     my ($any, $opts, $cmd) = @_;
     my $ssh2 = $any->{be_ssh2} or return;
-    my $channel = $ssh2->channel;
-    my ($out_fh, $err_fh) = __parse_fh_opts($any, $opts, $channel) or return;
-    $channel->exec($cmd);
-    __io3($any, $ssh2, $channel, $opts->{stdin_data}, $out_fh || \*STDOUT, $err_fh || \*STDERR);
+    if (my $channel = $ssh2->channel) {
+	my @fhs = __parse_fh_opts($any, $opts, $channel) or return;
+	if ($channel->process((defined $cmd and length $cmd) 
+			      ? ('exec' => $cmd)
+			      : 'shell')) {
+	    return ($channel, @fhs);
+	}
+    }
+    __copy_error($any, SSHA_CHANNEL_ERROR);
+    return;
+}
+
+sub _system {
+    my ($any, $opts, $cmd) = @_;
+    my ($channel, $out_fh, $err_fh) = __open_channel_and_exec($any, $opts, $cmd) or return;
+    __io3($any, $channel, $opts->{timeout},
+	  $opts->{stdin_data}, $out_fh || \*STDOUT, $err_fh || \*STDERR);
 }
 
 sub _capture {
     my ($any, $opts, $cmd) = @_;
-    my $ssh2 = $any->{be_ssh2} or return;
-    my $channel = $ssh2->channel;
-    my ($out_fh, $err_fh) = __parse_fh_opts($any, $opts, $channel) or return;
-    $out_fh and die 'Internal error: $out_fh is not undef';
-    $channel->exec($cmd);
-    (__io3($any, $ssh2, $channel, $opts->{stdin_data}, undef, $err_fh || \*STDERR))[0];
+    my ($channel, $out_fh, $err_fh) = __open_channel_and_exec($any, $opts, $cmd) or return;
+    die 'Internal error: $out_fh is not undef' if $out_fh;
+    (__io3($any, $channel, $opts->{timeout},
+	   $opts->{stdin_data}, undef, $err_fh || \*STDERR))[0];
 }
 
 sub _capture2 {
     my ($any, $opts, $cmd) = @_;
-    my $ssh2 = $any->{be_ssh2} or return;
-    my $channel = $ssh2->channel;
-    $channel->exec($cmd);
-    __io3($any, $ssh2, $channel, $opts->{stdin_data});
+    my ($channel, $out_fh, $err_fh) = __open_channel_and_exec($any, $opts, $cmd) or return;
+    die 'Internal error: $out_fh is not undef' if $out_fh;
+    die 'Internal error: $err_fh is not undef' if $err_fh;
+    __io3($any, $channel, $opts->{timeout}, $opts->{stdin_data});
 }
 
 sub __write_all {
@@ -186,11 +215,14 @@ sub _wait_for_more_data {
 }
 
 sub __io3 {
-    my ($any, $ssh2, $channel, $stdin_data, @fh) = @_;
+    my ($any, $channel, $timeout, $stdin_data, @fh) = @_;
+    my $ssh2 = $any->{be_ssh2} or return;
     $channel->blocking(0);
     my $in = '';
     my @cap = ('', '');
     my $eof_sent;
+    $timeout = $any->{timeout} unless defined $timeout;
+    my $start;
     while (1) {
         my $delay = 1;
         #$debug and $debug and 1024 and _debug("looping...");
@@ -238,6 +270,20 @@ sub __io3 {
         }
         last if $channel->eof;
 
+	if ($timeout) {
+	    if ($delay) {
+		my $now = Time::HiRes::time();
+		$start ||= $now;
+		if ($now - $start > $timeout) {
+		    $any->_set_error(SSHA_TIMEOUT_ERROR, "command timed out");
+		    last;
+		}
+	    }
+	    else {
+		undef $start;
+	    }
+	}
+
         $any->_wait_for_more_data(0.2) if $delay;
     }
 
@@ -246,7 +292,7 @@ sub __io3 {
     $channel->wait_closed;
 
     my $code = $channel->exit_status || 0;
-    my $signal = $channel->exit_signal || 0;
+    my $signal = _sig_name2num($channel->exit_signal) || 0;
 
     $channel->close or __copy_error($any, SSHA_CONNECTION_ERROR);
 
@@ -256,12 +302,10 @@ sub __io3 {
 
 sub _pipe {
     my ($any, $opts, $cmd) = @_;
-    my $ssh2 = $any->{be_ssh2} or return;
-    my $channel = $ssh2->channel;
-    __parse_fh_opts($any, $opts, $channel) or return;
-
+    my ($channel) = __open_channel_and_exec($any, $opts, $cmd) or return;
+    # TODO: do something with the parsed options?
     require Net::SSH::Any::Backend::Net_SSH2::Pipe;
-    Net::SSH::Any::Backend::Net_SSH2::Pipe->_new($any, $channel);
+    Net::SSH::Any::Backend::Net_SSH2::Pipe->_make($any, $channel);
 }
 
 sub _syswrite {
@@ -280,7 +324,8 @@ sub _syswrite {
 # appends at the end of $_[2] always!
 sub _sysread {
     my ($any, $channel, undef, $len, $ext) = @_;
-    my $bytes = $channel->read(my($buf), $len, $ext);
+    $debug and $debug & 8192 and _debug("trying to read $len bytes from channel");
+    my $bytes = $channel->read(my($buf), $len, $ext || 0);
     if (not $bytes) {
         __check_channel_error($any) or return undef;
     }
@@ -289,6 +334,7 @@ sub _sysread {
         return undef;
     }
     else {
+        $debug and $debug & 8192 and _debug_hexdump("data read", $buf);
         no warnings;
         $_[2] .= $buf;
     }
